@@ -14,7 +14,7 @@ using TMPro;
 
 namespace Ransom;
 
-[BepInPlugin("denyscrasav4ik.thedumbfactory.ransom", "Ransom", "1.0.0")]
+[BepInPlugin("denyscrasav4ik.thedumbfactory.ransom", "Ransom", "1.1.0")]
 public class RansomPlugin : BaseUnityPlugin
 {
     public static RansomPlugin Instance { get; private set; } = null!;
@@ -28,16 +28,20 @@ public class RansomPlugin : BaseUnityPlugin
     public ConfigEntry<float> MaxRansomTime { get; private set; } = null!;
     public ConfigEntry<int> MinRansomPoints { get; private set; } = null!;
     public ConfigEntry<int> MaxRansomPoints { get; private set; } = null!;
+    public ConfigEntry<bool> NonLethalMode { get; private set; } = null!;
 
-    float ransomTimeLimit, spawnTimer, ransomTimer, tauntSpawnTimer;
+    float ransomTimeLimit, spawnTimer, ransomTimer, tauntSpawnTimer, displayedRansomPoints;
     int requiredRansomPoints, currentDownloadSegment, currentRansomPoints, currentMusicLayer;
     bool ransomPaymentComplete;
 
     const float StaticInterval = .04f, FlickerInterval = .04f, VignetteInterval = .1f, HudInterval = .06f;
     const int DownloadSegments = 10;
+    const int EffectFrameCount = 30;
     const float SpawnIdleTime = .5f, DownloadHudScale = 1.4f, WindowAnimationDuration = 0.2f, WindowStartScale = 0.05f;
+    const float BackOvershoot = 1.70158f;
+    const float RansomCounterSmoothSpeed = 30f;
 
-    Coroutine staticCoroutine = null!, vignetteCoroutine = null!, wiggleCoroutine = null!, teleportMainCoroutine = null!;
+    Coroutine staticCoroutine = null!, vignetteCoroutine = null!, wiggleCoroutine = null!, teleportMainCoroutine = null!, inventoryRestoreCoroutine = null!;
 
     GameObject downloadHud = null!, ransomDemandWindow = null!;
     Text downloadText = null!, ransomDemandTitle = null!, ransomDemandAmount = null!, ransomDemandTimer = null!;
@@ -55,7 +59,12 @@ public class RansomPlugin : BaseUnityPlugin
 
     public Sprite stopSignSprite = null!, attackSprite = null!, idleSprite = null!, thankYouTextSprite = null!, okSignSprite = null!;
     public List<Sprite> tauntSprites = new();
-    Texture2D vignetteTexture = null!, staticTexture = null!;
+
+    readonly Sprite[] staticFrames = new Sprite[EffectFrameCount];
+    readonly Sprite[] vignetteFrames = new Sprite[EffectFrameCount];
+
+    int staticFrameIndex;
+    int vignetteFrameIndex;
 
     Vector3 warningOriginalScale, downloadHudOriginalScale;
     Vector2 warningOriginalSizeDelta, warningOriginalAnchoredPosition;
@@ -70,11 +79,12 @@ public class RansomPlugin : BaseUnityPlugin
         MaxRansomTime = Config.Bind("Ransom", "MaxRansomTime", 60f, "Maximum amount of time in seconds the player has to pay the ransom.");
         MinRansomPoints = Config.Bind("Ransom", "MinRansomPoints", 25, "Minimum points required by Ransom.");
         MaxRansomPoints = Config.Bind("Ransom", "MaxRansomPoints", 50, "Maximum points required by Ransom.");
+        NonLethalMode = Config.Bind("Ransom", "NonLethalMode", false, "If true, failing to pay the ransom removes all player items instead of ending the game.");
+
         ValidateConfig();
 
         LoadAssets();
-        vignetteTexture = GenerateVignetteTexture(512, 512);
-        staticTexture = GenerateStaticTexture(256, 256);
+        GenerateEffectFrames();
 
         new Harmony("denyscrasav4ik.thedumbfactory.ransom").PatchAll();
         CurrentState = RansomState.Inactive;
@@ -129,12 +139,11 @@ public class RansomPlugin : BaseUnityPlugin
         bundle.Unload(false);
     }
 
-    float GetSoundLength(SoundObject sound, float fallback) =>
-        sound != null && sound.soundClip != null ? sound.soundClip.length : fallback;
+    float GetSoundLength(SoundObject sound, float fallback) => sound != null && sound.soundClip != null ? sound.soundClip.length : fallback;
 
     void Update()
     {
-        if (Singleton<BaseGameManager>.Instance is PitstopGameManager)
+        if (Singleton<BaseGameManager>.Instance == null || Singleton<BaseGameManager>.Instance is PitstopGameManager || Singleton<BaseGameManager>.Instance is PlaceholderWinManager)
         {
             if (CurrentState != RansomState.Inactive) ResetEverything();
             return;
@@ -153,8 +162,11 @@ public class RansomPlugin : BaseUnityPlugin
 
                 if (ransomDemandWindow)
                 {
+                    float targetRansomPoints = requiredRansomPoints - currentRansomPoints;
+                    displayedRansomPoints = Mathf.MoveTowards(displayedRansomPoints, targetRansomPoints, RansomCounterSmoothSpeed * Time.deltaTime);
+                    ransomDemandAmount.text = Mathf.CeilToInt(displayedRansomPoints).ToString();
+
                     int secondsLeft = Mathf.Max(0, Mathf.CeilToInt(ransomTimer));
-                    ransomDemandAmount.text = $"{requiredRansomPoints - currentRansomPoints}";
                     ransomDemandTimer.text = string.Format(LocalizationManager.Instance.GetLocalizedText("Ransom_Time"), secondsLeft / 60, secondsLeft % 60);
                 }
 
@@ -173,6 +185,17 @@ public class RansomPlugin : BaseUnityPlugin
 
     IEnumerator MainRansomSequence()
     {
+        if (ransomCanvas == null)
+        {
+            InitializeRansomCanvas();
+
+            if (ransomCanvas == null || warningImage == null)
+            {
+                CurrentState = RansomState.Inactive;
+                yield break;
+            }
+        }
+
         CurrentState = RansomState.Sequence;
         ResetVisualState();
 
@@ -222,16 +245,14 @@ public class RansomPlugin : BaseUnityPlugin
         ScaleImageToScreen(warningImage);
 
         float attackLen = GetSoundLength(sndAttack, 2f);
-        PlaySound(sndAttack!);
+        PlaySound(sndInstall!);
 
         Coroutine flicker = StartCoroutine(RedWhiteFlicker(attackLen));
         yield return new WaitForSeconds(attackLen / 2f);
 
-        float installLen = Mathf.Max(0f, GetSoundLength(sndInstall, 4f) - 3f);
-        CoreGameManager.Instance?.audMan.FlushQueue(true);
-        PlaySound(sndInstall!);
+        float installLen = Mathf.Max(0f, GetSoundLength(sndInstall, 4f) - 2.751f);
         SetupDownloadHUD();
-        yield return SyncDownloadHud(installLen);
+        yield return SyncDownloadHud(installLen - 1.25f);
 
         if (flicker != null) StopCoroutine(flicker);
 
@@ -329,12 +350,15 @@ public class RansomPlugin : BaseUnityPlugin
 
     IEnumerator StaticAnimation()
     {
+        staticFrameIndex = UnityEngine.Random.Range(0, EffectFrameCount);
         while (true)
         {
-            Texture2D tex = GenerateStaticTexture(256, 256);
-            Sprite old = staticOverlay.sprite;
-            staticOverlay.sprite = Sprite.Create(tex, new Rect(0, 0, tex.width, tex.height), Vector2.one * .5f);
-            if (old) Destroy(old);
+            staticOverlay.sprite = staticFrames[staticFrameIndex];
+
+            staticFrameIndex++;
+            if (staticFrameIndex >= EffectFrameCount)
+                staticFrameIndex = 0;
+
             yield return new WaitForSeconds(StaticInterval);
         }
     }
@@ -439,6 +463,7 @@ public class RansomPlugin : BaseUnityPlugin
         requiredRansomPoints = UnityEngine.Random.Range(MinRansomPoints.Value, MaxRansomPoints.Value + 1);
         ransomTimer = ransomTimeLimit;
         currentRansomPoints = 0;
+        displayedRansomPoints = requiredRansomPoints;
         tauntSpawnTimer = 1;
         ransomPaymentComplete = false;
 
@@ -465,17 +490,41 @@ public class RansomPlugin : BaseUnityPlugin
         PlayMusicLayer(sndLayer1, true);
     }
 
+    void GenerateEffectFrames()
+    {
+        for (int i = 0; i < EffectFrameCount; i++)
+        {
+            Texture2D staticTexture = GenerateStaticTexture(480, 360);
+            staticFrames[i] = Sprite.Create(staticTexture, new Rect(0, 0, staticTexture.width, staticTexture.height), Vector2.one * .5f);
+
+            staticTexture.filterMode = FilterMode.Point;
+
+            Texture2D vignetteTexture = GenerateVignetteTexture(480, 360);
+            vignetteFrames[i] = Sprite.Create(vignetteTexture, new Rect(0, 0, vignetteTexture.width, vignetteTexture.height), Vector2.one * .5f);
+
+            vignetteTexture.filterMode = FilterMode.Point;
+        }
+
+        staticFrameIndex = 0;
+        vignetteFrameIndex = 0;
+    }
+
     IEnumerator AnimateVignette()
     {
+        vignetteFrameIndex = UnityEngine.Random.Range(0, EffectFrameCount);
+
         while (CurrentState == RansomState.RansomActive)
         {
-            Texture2D tex = GenerateVignetteTexture(512, 512);
-            Sprite old = vignetteOverlay.sprite;
-            vignetteOverlay.sprite = Sprite.Create(tex, new Rect(0, 0, tex.width, tex.height), Vector2.one * .5f);
-            if (old) Destroy(old);
+            vignetteOverlay.sprite = vignetteFrames[vignetteFrameIndex];
+
+            vignetteFrameIndex++;
+            if (vignetteFrameIndex >= EffectFrameCount)
+                vignetteFrameIndex = 0;
+
             yield return new WaitForSeconds(VignetteInterval);
         }
     }
+
 
     IEnumerator WiggleWindows()
     {
@@ -642,7 +691,7 @@ public class RansomPlugin : BaseUnityPlugin
         staticOverlay.color = Color.white;
         StartStaticAnimation();
 
-        float attackLen = Mathf.Max(0f, GetSoundLength(sndAttack, 3f) - 1f);
+        float attackLen = Mathf.Max(0f, GetSoundLength(sndAttack, 3f) - 1.758f);
         PlaySound(sndAttack!);
 
         Coroutine flicker = StartCoroutine(RedWhiteFlicker(attackLen));
@@ -656,6 +705,16 @@ public class RansomPlugin : BaseUnityPlugin
         ResetEverything();
 
         PlayerManager? player = CoreGameManager.Instance?.GetPlayer(0);
+
+        if (NonLethalMode.Value)
+        {
+            if (player != null && player.itm != null)
+                player.itm.ClearItems();
+
+            ResetEverything();
+            yield break;
+        }
+
         Baldi baldi = FindObjectOfType<Baldi>();
 
         if (player != null && baldi != null)
@@ -755,6 +814,12 @@ public class RansomPlugin : BaseUnityPlugin
 
     void RestoreInventoryIcons()
     {
+        if (inventoryRestoreCoroutine != null)
+        {
+            StopCoroutine(inventoryRestoreCoroutine);
+            inventoryRestoreCoroutine = null!;
+        }
+
         if (CoreGameManager.Instance == null)
         {
             originalItemSprites.Clear();
@@ -763,22 +828,116 @@ public class RansomPlugin : BaseUnityPlugin
 
         HudManager hud = CoreGameManager.Instance.GetHud(0);
         PlayerManager player = CoreGameManager.Instance.GetPlayer(0);
+
         if (!hud || !player || player.itm == null)
         {
             originalItemSprites.Clear();
             return;
         }
 
+        if (originalItemSprites.Count == 0)
+            return;
+
+        inventoryRestoreCoroutine = StartCoroutine(RestoreInventoryIconsSequence(hud, player));
+    }
+
+
+    IEnumerator RestoreInventoryIconsSequence(HudManager hud, PlayerManager player)
+    {
+        Dictionary<int, Sprite> spritesToRestore = new(originalItemSprites);
+
         for (int i = 0; i <= player.itm.maxItem; i++)
         {
-            if (originalItemSprites.TryGetValue(i, out Sprite sprite))
-                hud.UpdateItemIcon(i, sprite);
-            else if (player.itm.items[i] != null)
-                hud.UpdateItemIcon(i, player.itm.items[i].itemSpriteSmall);
+            if (!spritesToRestore.TryGetValue(i, out Sprite sprite))
+            {
+                if (player.itm.items[i] != null)
+                    sprite = player.itm.items[i].itemSpriteSmall;
+                else
+                    continue;
+            }
+
+            yield return FadeInventoryIcon(hud, i, sprite);
         }
 
         originalItemSprites.Clear();
+        inventoryRestoreCoroutine = null!;
     }
+
+
+    Image? GetInventoryIconImage(HudManager hud, int slot)
+    {
+        if (!hud || slot < 0)
+            return null;
+
+        FieldInfo? field = AccessTools.Field(typeof(HudManager), "itemSprites");
+        if (field?.GetValue(hud) is Image[] icons)
+        {
+            if (slot >= 0 && slot < icons.Length)
+                return icons[slot];
+        }
+
+        return null;
+    }
+
+    IEnumerator FadeInventoryIcon(HudManager hud, int slot, Sprite restoredSprite)
+    {
+        Image? icon = GetInventoryIconImage(hud, slot);
+
+        if (!icon)
+        {
+            hud.UpdateItemIcon(slot, restoredSprite);
+            yield break;
+        }
+
+        Color originalColor = icon!.color;
+        originalColor.a = 1f;
+
+        float duration = 1f;
+        float elapsed = 0f;
+
+        while (elapsed < duration)
+        {
+            if (!icon)
+                yield break;
+
+            elapsed += Time.deltaTime;
+            float t = Mathf.Clamp01(elapsed / duration);
+
+            Color color = originalColor;
+            color.a = Mathf.Lerp(1f, 0f, t);
+            icon.color = color;
+
+            yield return null;
+        }
+
+        hud.UpdateItemIcon(slot, restoredSprite);
+
+        icon = GetInventoryIconImage(hud, slot);
+
+        if (!icon)
+            yield break;
+
+        elapsed = 0f;
+
+        while (elapsed < duration)
+        {
+            if (!icon)
+                yield break;
+
+            elapsed += Time.deltaTime;
+            float t = Mathf.Clamp01(elapsed / duration);
+
+            Color color = Color.Lerp(Color.green, originalColor, t);
+            color.a = Mathf.Lerp(0f, 1f, t);
+
+            icon!.color = color;
+
+            yield return null;
+        }
+
+        icon!.color = originalColor;
+    }
+
 
     void SpawnTauntWindow()
     {
@@ -918,11 +1077,12 @@ public class RansomPlugin : BaseUnityPlugin
         ransomCanvas.sortingOrder = 999;
 
         staticOverlay = CreateImage("StaticOverlay", ransomCanvas.transform, new Vector2(Screen.width, Screen.height));
-        staticOverlay.sprite = Sprite.Create(staticTexture, new Rect(0, 0, staticTexture.width, staticTexture.height), Vector2.one * .5f);
+        staticOverlay.sprite = staticFrames[0];
         staticOverlay.color = Color.white;
 
         vignetteOverlay = CreateImage("VignetteOverlay", ransomCanvas.transform, new Vector2(Screen.width, Screen.height));
-        vignetteOverlay.sprite = Sprite.Create(vignetteTexture, new Rect(0, 0, vignetteTexture.width, vignetteTexture.height), Vector2.one * .5f);
+        vignetteOverlay.sprite = vignetteFrames[0];
+        vignetteOverlay.color = Color.white;
 
         warningImage = CreateImage("WarningImage", ransomCanvas.transform, new Vector2(400, 400));
         warningImage.sprite = idleSprite;
@@ -1114,6 +1274,8 @@ public class RansomPlugin : BaseUnityPlugin
     Texture2D GenerateStaticTexture(int width, int height)
     {
         Texture2D tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
+        tex.filterMode = FilterMode.Point;
+        tex.wrapMode = TextureWrapMode.Clamp;
         Color[] colors = new Color[width * height];
 
         for (int i = 0; i < colors.Length; i++)
