@@ -14,7 +14,7 @@ using TMPro;
 
 namespace Ransom;
 
-[BepInPlugin("denyscrasav4ik.thedumbfactory.ransom", "Ransom", "1.1.0")]
+[BepInPlugin("denyscrasav4ik.thedumbfactory.ransom", "Ransom", "1.1.1")]
 public class RansomPlugin : BaseUnityPlugin
 {
     public static RansomPlugin Instance { get; private set; } = null!;
