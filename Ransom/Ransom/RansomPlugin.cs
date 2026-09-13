@@ -38,7 +38,6 @@ public class RansomPlugin : BaseUnityPlugin
     const int DownloadSegments = 10;
     const int EffectFrameCount = 30;
     const float SpawnIdleTime = .5f, DownloadHudScale = 1.4f, WindowAnimationDuration = 0.2f, WindowStartScale = 0.05f;
-    const float BackOvershoot = 1.70158f;
     const float RansomCounterSmoothSpeed = 30f;
 
     Coroutine staticCoroutine = null!, vignetteCoroutine = null!, wiggleCoroutine = null!, teleportMainCoroutine = null!, inventoryRestoreCoroutine = null!;
@@ -441,7 +440,7 @@ public class RansomPlugin : BaseUnityPlugin
 
         string dots = new string('.', Time.frameCount % 4);
         downloadText.text = LocalizationManager.Instance.GetLocalizedText("Ransom_Downloading") + dots;
-        downloadText.color = UnityEngine.Random.value < .08f ? new Color(1, .03f, .03f) : Color.white;
+        downloadText.color = UnityEngine.Random.value < .25f ? new Color(1f, .03f, .03f) : Color.white;
         downloadProgressGlow.rectTransform.sizeDelta = new Vector2(680 * progress, 36);
 
         float glow = .08f + Mathf.Sin(Time.time * 12) * .04f;
@@ -610,6 +609,7 @@ public class RansomPlugin : BaseUnityPlugin
         StopAllRansomCoroutines();
         StopMusic();
         ClearTauntWindows();
+        RestoreInventoryIcons(true);
 
         vignetteOverlay.gameObject.SetActive(false);
         staticOverlay.gameObject.SetActive(false);
@@ -686,7 +686,7 @@ public class RansomPlugin : BaseUnityPlugin
         warningImage.color = Color.white;
         RestoreWarningImageTransform();
         ScaleImageToScreen(warningImage);
-
+        vignetteOverlay.gameObject.SetActive(false);
         staticOverlay.gameObject.SetActive(true);
         staticOverlay.color = Color.white;
         StartStaticAnimation();
@@ -727,7 +727,7 @@ public class RansomPlugin : BaseUnityPlugin
     {
         StopAllRansomCoroutines();
         StopMusic();
-        RestoreInventoryIcons();
+        RestoreInventoryIcons(false);
         ClearTauntWindows();
 
         if (warningImage)
@@ -812,7 +812,7 @@ public class RansomPlugin : BaseUnityPlugin
         }
     }
 
-    void RestoreInventoryIcons()
+    void RestoreInventoryIcons(bool animate)
     {
         if (inventoryRestoreCoroutine != null)
         {
@@ -838,29 +838,32 @@ public class RansomPlugin : BaseUnityPlugin
         if (originalItemSprites.Count == 0)
             return;
 
+        if (!animate)
+        {
+            foreach (var pair in originalItemSprites)
+                hud.UpdateItemIcon(pair.Key, pair.Value);
+
+            originalItemSprites.Clear();
+            return;
+        }
+
         inventoryRestoreCoroutine = StartCoroutine(RestoreInventoryIconsSequence(hud, player));
     }
 
-
     IEnumerator RestoreInventoryIconsSequence(HudManager hud, PlayerManager player)
     {
-        Dictionary<int, Sprite> spritesToRestore = new(originalItemSprites);
-
-        for (int i = 0; i <= player.itm.maxItem; i++)
+        foreach (var pair in originalItemSprites)
         {
-            if (!spritesToRestore.TryGetValue(i, out Sprite sprite))
-            {
-                if (player.itm.items[i] != null)
-                    sprite = player.itm.items[i].itemSpriteSmall;
-                else
-                    continue;
-            }
+            if (!hud || !player)
+                yield break;
 
-            yield return FadeInventoryIcon(hud, i, sprite);
+            StartCoroutine(FadeInventoryIcon(hud, pair.Key, pair.Value));
+
+            yield return new WaitForSeconds(0.1f);
         }
 
-        originalItemSprites.Clear();
         inventoryRestoreCoroutine = null!;
+        originalItemSprites.Clear();
     }
 
 
@@ -881,34 +884,10 @@ public class RansomPlugin : BaseUnityPlugin
 
     IEnumerator FadeInventoryIcon(HudManager hud, int slot, Sprite restoredSprite)
     {
-        Image? icon = GetInventoryIconImage(hud, slot);
-
-        if (!icon)
-        {
-            hud.UpdateItemIcon(slot, restoredSprite);
+        if (!hud || CoreGameManager.Instance == null || CoreGameManager.Instance.GetPlayer(0) == null)
             yield break;
-        }
 
-        Color originalColor = icon!.color;
-        originalColor.a = 1f;
-
-        float duration = 1f;
-        float elapsed = 0f;
-
-        while (elapsed < duration)
-        {
-            if (!icon)
-                yield break;
-
-            elapsed += Time.deltaTime;
-            float t = Mathf.Clamp01(elapsed / duration);
-
-            Color color = originalColor;
-            color.a = Mathf.Lerp(1f, 0f, t);
-            icon.color = color;
-
-            yield return null;
-        }
+        Image? icon = GetInventoryIconImage(hud, slot);
 
         hud.UpdateItemIcon(slot, restoredSprite);
 
@@ -917,27 +896,25 @@ public class RansomPlugin : BaseUnityPlugin
         if (!icon)
             yield break;
 
-        elapsed = 0f;
+        const float fadeDuration = 0.5f;
+        float elapsed = 0f;
 
-        while (elapsed < duration)
+        while (elapsed < fadeDuration)
         {
             if (!icon)
                 yield break;
 
             elapsed += Time.deltaTime;
-            float t = Mathf.Clamp01(elapsed / duration);
+            float t = Mathf.Clamp01(elapsed / fadeDuration);
 
-            Color color = Color.Lerp(Color.green, originalColor, t);
-            color.a = Mathf.Lerp(0f, 1f, t);
-
-            icon!.color = color;
+            icon!.color = Color.Lerp(Color.green, Color.white, t);
 
             yield return null;
         }
 
-        icon!.color = originalColor;
+        if (icon)
+            icon!.color = Color.white;
     }
-
 
     void SpawnTauntWindow()
     {
